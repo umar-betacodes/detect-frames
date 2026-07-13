@@ -1,0 +1,22 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Runtime outputs
+output/
+tmp_segments/
+*.partial
+
+# Model weights (large binaries — keep local or use Git LFS)
+*.pt
+*.onnx
+*.engine
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
