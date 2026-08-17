@@ -43,25 +43,50 @@ ROI_COORDS: List[Tuple[int, int]] = [
 
 STREAMS: List[dict] = [
     {
-        "camera_id": "Faisal-Spinning",
-        "url": "https://faisal-stream.betacodespk.com/streams/FaisalSpiningcamera1/live.m3u8",
-        "roi_coords": [(828, 422), (444, 321), (226, 524), (596, 719)],
+        "camera_id": "JK-Cam1",
+        "url": "https://jk-stream.betacodespk.com/raw/JKCam1/live.m3u8",
+        "roi_coords": [(321, 157), (680, 131), (689, 449), (337, 483)],
+    },
+        {
+        "camera_id": "JK-Cam2",
+        "url": "https://jk-stream.betacodespk.com/raw/JKCam2/live.m3u8",
+        "roi_coords": [(354, 53), (721, 66), (663, 615), (334, 463)]
+    },
+        {
+        "camera_id": "JK-Cam3",
+        "url": "https://jk-stream.betacodespk.com/raw/JKCam3/live.m3u8",
+        "roi_coords": [(281, 20), (720, 16), (717, 582), (281, 586)],
     },
     {
-        "camera_id": "Akram-Textile",
-        "url": "https://akram-stream.betacodespk.com/streams/AkramCamera1/live.m3u8",
-        "roi_coords": [(828, 422), (444, 321), (226, 524), (596, 719)],
+        "camera_id": "JK-Cam4",
+        "url": "https://jk-stream.betacodespk.com/raw/JKCam4/live.m3u8",
+        "roi_coords": [(219, 0), (844, 0), (880, 540), (328, 683)],
+    },
+        {
+        "camera_id": "Best-Cam1",
+        "url": "https://bestfiber-stream.betacodespk.com/raw/BestfibersCam1/live.m3u8",
+        "roi_coords": [(576, 1), (886, 1), (886, 401), (576, 401)],
+    },
+        {
+        "camera_id": "Best-Cam2",
+        "url": "https://bestfiber-stream.betacodespk.com/raw/BestfibersCam2/live.m3u8",
+        "roi_coords": [(531, 0), (534, 519), (932, 560), (970, 4)],
+    },
+            {
+        "camera_id": "Soorty-Cam2",
+        "url": "https://soorty2-stream.betacodespk.com/raw/soorty02Cam2/live.m3u8",
     },
 ]
 
+#https://soorty2-stream.betacodespk.com/raw/soorty02Cam1/live.m3u8
 YOLO_MODEL = "yolo26m.onnx"
 PERSON_CLASS_ID = 0
-CONFIDENCE_THRESHOLD = 0.35
+CONFIDENCE_THRESHOLD = 0.20
 IOU_THRESHOLD = 0.45
-YOLO_DEVICE = 1
+YOLO_DEVICE = 0
 
 SOURCE_FPS = 20
-INFERENCE_FPS = 1
+INFERENCE_FPS = 0.5
 FRAME_STRIDE = max(1, int(round(SOURCE_FPS / INFERENCE_FPS)))
 
 CATCHUP_OFFSET_SECONDS = 1 * 3600
@@ -196,6 +221,7 @@ class PlaylistParser:
         return f"{parsed.scheme}://{parsed.netloc}{path}"
 
     def load(self) -> m3u8.M3U8:
+        """Sync load via urllib (new TCP each call). Prefer load_async() with aiohttp."""
         playlist = m3u8.load(self.playlist_url)
         if playlist.is_variant and playlist.playlists:
             best = max(
@@ -208,6 +234,32 @@ class PlaylistParser:
             self.base_uri = self._base_uri(media_url)
             playlist = m3u8.load(media_url)
         return playlist
+
+    async def load_async(self, session: aiohttp.ClientSession) -> m3u8.M3U8:
+        """
+        Load playlist via the shared aiohttp session — reuses TCP connections
+        with segment downloads (no new urllib opener per poll).
+        """
+        playlist = await self._fetch_playlist(session, self.playlist_url)
+        if playlist.is_variant and playlist.playlists:
+            best = max(
+                playlist.playlists,
+                key=lambda p: (p.stream_info.bandwidth or 0),
+            )
+            media_url = urljoin(self.playlist_url, best.uri)
+            logger.info("Resolved variant playlist → %s", media_url)
+            self.playlist_url = media_url
+            self.base_uri = self._base_uri(media_url)
+            playlist = await self._fetch_playlist(session, media_url)
+        return playlist
+
+    async def _fetch_playlist(
+        self, session: aiohttp.ClientSession, url: str
+    ) -> m3u8.M3U8:
+        async with session.get(url) as resp:
+            resp.raise_for_status()
+            text = await resp.text()
+        return m3u8.loads(text, uri=url)
 
     def segments_from_playlist(self, playlist: m3u8.M3U8) -> List[SegmentInfo]:
         media_seq = playlist.media_sequence or 0
@@ -470,7 +522,7 @@ class SegmentProducer:
 
             # ---- Hold ONE playlist snapshot ----
             try:
-                playlist = await asyncio.to_thread(self.parser.load)
+                playlist = await self.parser.load_async(session)
             except Exception as exc:
                 logger.error(
                     "[%s] Failed to load playlist %s: %s",
@@ -512,7 +564,7 @@ class SegmentProducer:
             logger.info("[%s] Catch-up done — live poll mode", self.config.camera_id)
             while not self._stop.is_set():
                 try:
-                    playlist = await asyncio.to_thread(self.parser.load)
+                    playlist = await self.parser.load_async(session)
                     live_segs = self.parser.segments_from_playlist(playlist)
                     new_segs = [s for s in live_segs if s.key not in self._seen]
                     if new_segs:
