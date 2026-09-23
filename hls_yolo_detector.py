@@ -10,18 +10,23 @@ Catch-up strategy (single-shot, industry-standard HLS bulk download):
      between segments. YOLO does not run during a download wave.
   4. After a wave is fully on disk, feed segments to YOLO in order.
   5. When the held list is exhausted, poll the live m3u8 for new segments.
+
+Per segment, in-band KLV/ID3 json-v1 metadata (same as dashboard/) is parsed
+and drawn onto each sampled frame before person ROI hits are saved, so output
+frames show bale ROI/objects plus person detections on top.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import shutil
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import urljoin, urlparse
 
 import aiohttp
@@ -29,6 +34,12 @@ import cv2
 import m3u8
 import numpy as np
 from ultralytics import YOLO
+
+# Metadata overlay source resolution (matches dashboard/js/overlay.js).
+META_SRC_W = 1280
+META_SRC_H = 720
+TS_PACKET = 188
+TS_SYNC = 0x47
 
 # ---------------------------------------------------------------------------
 # Configuration — edit these for your deployment
@@ -43,57 +54,33 @@ ROI_COORDS: List[Tuple[int, int]] = [
 
 STREAMS: List[dict] = [
     {
-        "camera_id": "JK-Cam1",
-        "url": "https://jk-stream.betacodespk.com/raw/JKCam1/live.m3u8",
-        "roi_coords": [(321, 157), (680, 131), (689, 449), (337, 483)],
-    },
-        {
-        "camera_id": "JK-Cam2",
-        "url": "https://jk-stream.betacodespk.com/raw/JKCam2/live.m3u8",
-        "roi_coords": [(354, 53), (721, 66), (663, 615), (334, 463)]
-    },
-        {
-        "camera_id": "JK-Cam3",
-        "url": "https://jk-stream.betacodespk.com/raw/JKCam3/live.m3u8",
-        "roi_coords": [(281, 20), (720, 16), (717, 582), (281, 586)],
+        "camera_id": "Faisal-Spinning",
+        "url": "https://faisal-stream.betacodespk.com/streams/FaisalSpiningcamera1/live.m3u8",
+        "roi_coords": [(828, 422), (444, 321), (226, 524), (596, 719)],
     },
     {
-        "camera_id": "JK-Cam4",
-        "url": "https://jk-stream.betacodespk.com/raw/JKCam4/live.m3u8",
-        "roi_coords": [(219, 0), (844, 0), (880, 540), (328, 683)],
-    },
-        {
-        "camera_id": "Best-Cam1",
-        "url": "https://bestfiber-stream.betacodespk.com/raw/BestfibersCam1/live.m3u8",
-        "roi_coords": [(576, 1), (886, 1), (886, 401), (576, 401)],
-    },
-        {
-        "camera_id": "Best-Cam2",
-        "url": "https://bestfiber-stream.betacodespk.com/raw/BestfibersCam2/live.m3u8",
-        "roi_coords": [(531, 0), (534, 519), (932, 560), (970, 4)],
-    },
-            {
-        "camera_id": "Soorty-Cam2",
-        "url": "https://soorty2-stream.betacodespk.com/raw/soorty02Cam2/live.m3u8",
+        "camera_id": "Akram-Textile",
+        "url": "https://akram-stream.betacodespk.com/streams/AkramCamera1/live.m3u8",
+        "roi_coords": [(828, 422), (444, 321), (226, 524), (596, 719)],
     },
 ]
 
-#https://soorty2-stream.betacodespk.com/raw/soorty02Cam1/live.m3u8
 YOLO_MODEL = "yolo26m.onnx"
 PERSON_CLASS_ID = 0
-CONFIDENCE_THRESHOLD = 0.20
+CONFIDENCE_THRESHOLD = 0.35
 IOU_THRESHOLD = 0.45
+# Only one GPU on this host (cuda:0). Use 0, or None to auto-pick.
 YOLO_DEVICE = 0
 
 SOURCE_FPS = 20
-INFERENCE_FPS = 0.5
+INFERENCE_FPS = 1
 FRAME_STRIDE = max(1, int(round(SOURCE_FPS / INFERENCE_FPS)))
 
 CATCHUP_OFFSET_SECONDS = 1 * 3600
 
 # Single-shot bulk download settings (aiom3u8downloader-style).
 # Concurrency > ~24 does NOT help on this CDN — pipe caps ~1.2 MB/s.
-DOWNLOAD_CONCURRENCY = 24
+DOWNLOAD_CONCURRENCY = 1
 DOWNLOAD_RETRIES = 3  # transient errors only; 404 fails immediately
 DOWNLOAD_RETRY_BASE_DELAY = 0.4
 DOWNLOAD_TIMEOUT_TOTAL = 90
@@ -204,6 +191,459 @@ def bbox_intersects_roi(
 
 
 # ---------------------------------------------------------------------------
+# In-band TS metadata (KLV / ID3 json-v1) — port of dashboard/js/ts-meta.js
+# ---------------------------------------------------------------------------
+
+@dataclass
+class MetaSample:
+    json: Dict[str, Any]
+    media_time: float
+    pts90k: Optional[int] = None
+    carrier: str = ""
+
+
+def _read_u16(buf: bytes, off: int) -> int:
+    return (buf[off] << 8) | buf[off + 1]
+
+
+def _parse_pts(buf: bytes, off: int) -> int:
+    return (
+        ((buf[off] & 0x0E) << 29)
+        | (buf[off + 1] << 22)
+        | ((buf[off + 2] & 0xFE) << 14)
+        | (buf[off + 3] << 7)
+        | ((buf[off + 4] & 0xFE) >> 1)
+    )
+
+
+def _syncsafe_to_int(b: bytes) -> int:
+    return ((b[0] & 0x7F) << 21) | ((b[1] & 0x7F) << 14) | ((b[2] & 0x7F) << 7) | (b[3] & 0x7F)
+
+
+def _extract_id3_json(payload: bytes) -> Optional[Dict[str, Any]]:
+    if len(payload) < 10 or payload[0:3] != b"ID3":
+        return None
+    tag_size = _syncsafe_to_int(payload[6:10])
+    off = 10
+    end = min(len(payload), 10 + tag_size)
+    while off + 10 <= end:
+        frame_id = payload[off : off + 4].decode("ascii", errors="ignore")
+        frame_len = _syncsafe_to_int(payload[off + 4 : off + 8])
+        off += 10
+        if off + frame_len > end:
+            break
+        if frame_id == "TXXX":
+            body = payload[off : off + frame_len]
+            if len(body) >= 6:
+                p = 1
+                while p < len(body) and body[p] != 0:
+                    p += 1
+                desc = body[1:p].decode("utf-8", errors="ignore")
+                p += 1
+                if desc == "DSMD":
+                    try:
+                        obj = json.loads(body[p:].decode("utf-8", errors="ignore"))
+                        if isinstance(obj, dict) and obj.get("v") == "json-v1":
+                            return obj
+                    except (json.JSONDecodeError, UnicodeError):
+                        pass
+        off += frame_len
+    return None
+
+
+def _extract_klv_json(payload: bytes) -> Optional[Dict[str, Any]]:
+    try:
+        text = payload.decode("utf-8", errors="ignore").strip()
+        if text.startswith("{"):
+            obj = json.loads(text)
+            if isinstance(obj, dict) and obj.get("v") == "json-v1":
+                return obj
+    except (json.JSONDecodeError, UnicodeError):
+        pass
+    start = payload.find(b"{")
+    if start >= 0:
+        try:
+            obj = json.loads(payload[start:].decode("utf-8", errors="ignore"))
+            if isinstance(obj, dict) and obj.get("v") == "json-v1":
+                return obj
+        except (json.JSONDecodeError, UnicodeError):
+            pass
+    return None
+
+
+def _decode_metadata_payload(
+    payload: bytes, carrier_hint: Optional[str] = None
+) -> Optional[Dict[str, Any]]:
+    if not payload:
+        return None
+    if carrier_hint == "id3":
+        return _extract_id3_json(payload) or _extract_klv_json(payload)
+    return _extract_klv_json(payload) or _extract_id3_json(payload)
+
+
+class _PesAssembler:
+    def __init__(self) -> None:
+        self.buf = bytearray()
+        self.pts: Optional[int] = None
+
+    def reset(self) -> None:
+        self.buf.clear()
+        self.pts = None
+
+    def push(self, data: bytes, pts: Optional[int] = None) -> None:
+        if (
+            pts is None
+            and len(data) >= 9
+            and data[0] == 0
+            and data[1] == 0
+            and data[2] == 1
+        ):
+            flags = data[7]
+            if flags & 0x01 or flags & 0x02:
+                self.pts = _parse_pts(data, 9)
+        if pts is not None:
+            self.pts = pts
+        self.buf.extend(data)
+
+    def take_complete(self) -> Optional[Tuple[bytes, Optional[int]]]:
+        if len(self.buf) < 9:
+            return None
+        if self.buf[0] != 0 or self.buf[1] != 0 or self.buf[2] != 1:
+            self.reset()
+            return None
+        pes_len = _read_u16(self.buf, 4)
+        pes_hdr_len = self.buf[8] or 0
+        header_len = 9 + pes_hdr_len
+        total = len(self.buf) if pes_len == 0 else 6 + pes_len
+        if len(self.buf) < total:
+            return None
+        payload = bytes(self.buf[header_len:total])
+        pts = self.pts
+        del self.buf[:total]
+        if not self.buf:
+            self.pts = None
+        return payload, pts
+
+
+class TsMetaParser:
+    """Extract json-v1 metadata samples from an MPEG-TS segment."""
+
+    def __init__(self) -> None:
+        self.pmt_pid: Optional[int] = None
+        self.video_pid: Optional[int] = None
+        self.meta_pid: Optional[int] = None
+        self.meta_stream_type: Optional[int] = None
+        self.video_asm = _PesAssembler()
+        self.meta_asm = _PesAssembler()
+
+    def reset(self) -> None:
+        self.pmt_pid = None
+        self.video_pid = None
+        self.meta_pid = None
+        self.meta_stream_type = None
+        self.video_asm.reset()
+        self.meta_asm.reset()
+
+    def _parse_pat(self, payload: bytes) -> None:
+        if len(payload) < 8:
+            return
+        section_len = ((payload[1] & 0x0F) << 8) | payload[2]
+        off = 8
+        end = 3 + section_len - 4
+        while off + 4 <= end:
+            program_num = _read_u16(payload, off)
+            pid = ((payload[off + 2] & 0x1F) << 8) | payload[off + 3]
+            if program_num != 0:
+                self.pmt_pid = pid
+                break
+            off += 4
+
+    def _parse_pmt(self, payload: bytes) -> None:
+        if len(payload) < 12:
+            return
+        section_len = ((payload[1] & 0x0F) << 8) | payload[2]
+        off = 12 + (((payload[10] & 0x0F) << 8) | payload[11])
+        end = 3 + section_len - 4
+        while off + 5 <= end:
+            stream_type = payload[off]
+            pid = ((payload[off + 1] & 0x1F) << 8) | payload[off + 2]
+            es_info_len = ((payload[off + 3] & 0x0F) << 8) | payload[off + 4]
+            off += 5 + es_info_len
+            if stream_type == 0x1B and self.video_pid is None:
+                self.video_pid = pid
+            elif stream_type in (0x06, 0x15) and self.meta_pid is None:
+                self.meta_pid = pid
+                self.meta_stream_type = stream_type
+
+    def _carrier_hint(self) -> Optional[str]:
+        if self.meta_stream_type == 0x15:
+            return "id3"
+        if self.meta_stream_type == 0x06:
+            return "klv"
+        return None
+
+    def _handle_pes(self, pid: int, payload: bytes, pusi: bool) -> List[dict]:
+        if pid != self.video_pid and pid != self.meta_pid:
+            return []
+        asm = self.video_asm if pid == self.video_pid else self.meta_asm
+        if pusi:
+            asm.reset()
+        asm.push(payload)
+        out: List[dict] = []
+        if pid == self.video_pid:
+            complete = asm.take_complete()
+            if complete:
+                out.append({"kind": "video", "payload": complete[0], "pts": complete[1]})
+        else:
+            while True:
+                complete = asm.take_complete()
+                if not complete:
+                    break
+                meta_payload, pts = complete
+                js = _decode_metadata_payload(meta_payload, self._carrier_hint())
+                out.append(
+                    {
+                        "kind": "meta",
+                        "payload": meta_payload,
+                        "pts": pts,
+                        "json": js,
+                    }
+                )
+        return out
+
+    def parse_segment(
+        self, data: bytes, frag_start_sec: float = 0.0
+    ) -> List[MetaSample]:
+        self.video_asm.reset()
+        self.meta_asm.reset()
+        samples: List[MetaSample] = []
+        first_video_pts: Optional[int] = None
+        first_meta_pts: Optional[int] = None
+        first_pts_ns: Optional[float] = None
+        hint = None
+
+        for i in range(0, len(data) - TS_PACKET + 1, TS_PACKET):
+            if data[i] != TS_SYNC:
+                continue
+            pid = ((data[i + 1] & 0x1F) << 8) | data[i + 2]
+            afc = (data[i + 3] >> 4) & 0x03
+            off = i + 4
+            if afc in (0x02, 0x03):
+                adapt_len = data[off]
+                off += 1 + adapt_len
+            if afc == 0x00:
+                continue
+            payload = data[off : i + TS_PACKET]
+            pusi = bool(data[i + 1] & 0x40)
+
+            if pid == 0x0000:
+                if pusi and payload:
+                    start = payload[0] + 1
+                    self._parse_pat(payload[start:])
+                continue
+            if self.pmt_pid is not None and pid == self.pmt_pid:
+                if pusi and payload:
+                    start = payload[0] + 1
+                    self._parse_pmt(payload[start:])
+                continue
+            if pid != self.video_pid and pid != self.meta_pid:
+                continue
+
+            hint = self._carrier_hint()
+            pes_chunks = self._handle_pes(pid, payload, pusi)
+            if not pes_chunks:
+                if pid == self.meta_pid and payload:
+                    js = _decode_metadata_payload(payload, hint)
+                    if js:
+                        samples.append(
+                            MetaSample(
+                                json=js,
+                                media_time=frag_start_sec,
+                                carrier=js.get("carrier") or hint or "",
+                            )
+                        )
+                continue
+
+            for item in pes_chunks:
+                if item["kind"] == "video" and item["pts"] is not None and first_video_pts is None:
+                    first_video_pts = item["pts"]
+                if item["kind"] != "meta":
+                    continue
+                js = item.get("json")
+                if not js and item.get("payload"):
+                    js = _decode_metadata_payload(item["payload"], hint)
+                if not js:
+                    continue
+                pts90k = item.get("pts")
+                if pts90k is None and js.get("pts_ns") is not None:
+                    pts90k = int(float(js["pts_ns"]) / (1_000_000_000 / 90_000))
+                if pts90k is not None and first_meta_pts is None:
+                    first_meta_pts = pts90k
+                if js.get("pts_ns") is not None and first_pts_ns is None:
+                    first_pts_ns = float(js["pts_ns"])
+
+                media_time = frag_start_sec
+                if js.get("pts_ns") is not None and first_pts_ns is not None:
+                    media_time = frag_start_sec + (float(js["pts_ns"]) - first_pts_ns) / 1e9
+                elif pts90k is not None and first_video_pts is not None:
+                    media_time = frag_start_sec + (pts90k - first_video_pts) / 90_000.0
+                elif pts90k is not None and first_meta_pts is not None:
+                    media_time = frag_start_sec + (pts90k - first_meta_pts) / 90_000.0
+
+                samples.append(
+                    MetaSample(
+                        json=js,
+                        media_time=media_time,
+                        pts90k=pts90k,
+                        carrier=js.get("carrier") or hint or "",
+                    )
+                )
+
+        samples.sort(key=lambda s: s.media_time)
+        return samples
+
+
+def pick_meta_sample(
+    samples: Sequence[MetaSample], current_time: float
+) -> Optional[MetaSample]:
+    """Last sample with media_time <= current_time (+1 frame slack)."""
+    if not samples:
+        return None
+    slack = 0.06
+    best: Optional[MetaSample] = None
+    lo, hi = 0, len(samples) - 1
+    while lo <= hi:
+        mid = (lo + hi) >> 1
+        if samples[mid].media_time <= current_time + slack:
+            best = samples[mid]
+            lo = mid + 1
+        else:
+            hi = mid - 1
+    if best is not None:
+        return best
+    first = samples[0]
+    if first.media_time - current_time < 0.25:
+        return first
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Metadata overlay drawing — port of dashboard/js/overlay.js
+# ---------------------------------------------------------------------------
+
+def _map_point(
+    x: float, y: float, fw: int, fh: int
+) -> Tuple[int, int]:
+    return (
+        int(round((x / META_SRC_W) * fw)),
+        int(round((y / META_SRC_H) * fh)),
+    )
+
+
+def draw_metadata_overlay(frame: np.ndarray, meta: Dict[str, Any]) -> np.ndarray:
+    """Draw ROI lines, tracked objects, and HUD onto a BGR frame copy."""
+    out = frame.copy()
+    fh, fw = out.shape[:2]
+    exit_set = set(meta.get("roi_exit_idx") or [])
+
+    for i, line in enumerate(meta.get("roi_lines") or []):
+        if not line or len(line) < 2:
+            continue
+        (x1, y1), (x2, y2) = line[0], line[1]
+        p1 = _map_point(x1, y1, fw, fh)
+        p2 = _map_point(x2, y2, fw, fh)
+        color = (0, 0, 255) if i in exit_set else (255, 212, 0)  # BGR
+        cv2.line(out, p1, p2, color, 2, cv2.LINE_AA)
+
+    for obj in meta.get("objects") or []:
+        bb = obj.get("bb")
+        if not bb or len(bb) < 4:
+            continue
+        x1, y1, x2, y2 = bb
+        tl = _map_point(x1, y1, fw, fh)
+        br = _map_point(x2, y2, fw, fh)
+        inside = bool(obj.get("ir"))
+        color = (136, 255, 0) if inside else (136, 136, 136)  # BGR
+        thickness = 2 if inside else 1
+        cv2.rectangle(out, tl, br, color, thickness)
+        label = f"#{obj.get('tid', '?')}"
+        if obj.get("ts"):
+            label += f" {obj['ts']}"
+        try:
+            label += f" {float(obj.get('cf') or 0):.2f}"
+        except (TypeError, ValueError):
+            pass
+        ty = max(tl[1] - 4, 12)
+        cv2.putText(
+            out,
+            label,
+            (tl[0] + 2, ty),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.4,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+
+    hud_lines = [
+        f"ch={meta.get('ch', '?')}  f={meta.get('f', '?')}  "
+        f"carrier={meta.get('carrier', '?')}",
+        f"total={meta.get('total', 0)}  roi={meta.get('roi_count', 0)}  "
+        f"objs={meta.get('obj_count', 0)}",
+        f"zone={meta.get('zone', '-')}  mode={meta.get('mode', '-')}",
+    ]
+    pad_x, pad_y = 8, 8
+    line_h = 16
+    box_w = 420
+    box_h = 8 + len(hud_lines) * line_h
+    overlay = out.copy()
+    cv2.rectangle(
+        overlay,
+        (pad_x, pad_y),
+        (pad_x + box_w, pad_y + box_h),
+        (0, 0, 0),
+        -1,
+    )
+    cv2.addWeighted(overlay, 0.65, out, 0.35, 0, out)
+    for i, line in enumerate(hud_lines):
+        cv2.putText(
+            out,
+            line,
+            (pad_x + 6, pad_y + 18 + i * line_h),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.42,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+    return out
+
+
+def draw_person_boxes(
+    frame: np.ndarray,
+    boxes: Sequence[Tuple[float, float, float, float]],
+    color: Tuple[int, int, int] = (0, 0, 255),
+) -> np.ndarray:
+    """Draw YOLO person detections on top of an already-annotated frame."""
+    out = frame
+    for x1, y1, x2, y2 in boxes:
+        p1 = (int(round(x1)), int(round(y1)))
+        p2 = (int(round(x2)), int(round(y2)))
+        cv2.rectangle(out, p1, p2, color, 2)
+        cv2.putText(
+            out,
+            "person",
+            (p1[0], max(p1[1] - 6, 12)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
+    return out
+
+
+# ---------------------------------------------------------------------------
 # M3U8 parsing & time navigation
 # ---------------------------------------------------------------------------
 
@@ -221,7 +661,6 @@ class PlaylistParser:
         return f"{parsed.scheme}://{parsed.netloc}{path}"
 
     def load(self) -> m3u8.M3U8:
-        """Sync load via urllib (new TCP each call). Prefer load_async() with aiohttp."""
         playlist = m3u8.load(self.playlist_url)
         if playlist.is_variant and playlist.playlists:
             best = max(
@@ -234,32 +673,6 @@ class PlaylistParser:
             self.base_uri = self._base_uri(media_url)
             playlist = m3u8.load(media_url)
         return playlist
-
-    async def load_async(self, session: aiohttp.ClientSession) -> m3u8.M3U8:
-        """
-        Load playlist via the shared aiohttp session — reuses TCP connections
-        with segment downloads (no new urllib opener per poll).
-        """
-        playlist = await self._fetch_playlist(session, self.playlist_url)
-        if playlist.is_variant and playlist.playlists:
-            best = max(
-                playlist.playlists,
-                key=lambda p: (p.stream_info.bandwidth or 0),
-            )
-            media_url = urljoin(self.playlist_url, best.uri)
-            logger.info("Resolved variant playlist → %s", media_url)
-            self.playlist_url = media_url
-            self.base_uri = self._base_uri(media_url)
-            playlist = await self._fetch_playlist(session, media_url)
-        return playlist
-
-    async def _fetch_playlist(
-        self, session: aiohttp.ClientSession, url: str
-    ) -> m3u8.M3U8:
-        async with session.get(url) as resp:
-            resp.raise_for_status()
-            text = await resp.text()
-        return m3u8.loads(text, uri=url)
 
     def segments_from_playlist(self, playlist: m3u8.M3U8) -> List[SegmentInfo]:
         media_seq = playlist.media_sequence or 0
@@ -522,7 +935,7 @@ class SegmentProducer:
 
             # ---- Hold ONE playlist snapshot ----
             try:
-                playlist = await self.parser.load_async(session)
+                playlist = await asyncio.to_thread(self.parser.load)
             except Exception as exc:
                 logger.error(
                     "[%s] Failed to load playlist %s: %s",
@@ -564,7 +977,7 @@ class SegmentProducer:
             logger.info("[%s] Catch-up done — live poll mode", self.config.camera_id)
             while not self._stop.is_set():
                 try:
-                    playlist = await self.parser.load_async(session)
+                    playlist = await asyncio.to_thread(self.parser.load)
                     live_segs = self.parser.segments_from_playlist(playlist)
                     new_segs = [s for s in live_segs if s.key not in self._seen]
                     if new_segs:
@@ -633,13 +1046,44 @@ class YOLODetector:
         iou: float = IOU_THRESHOLD,
         device: Optional[str] = None,
     ) -> None:
-        self.model = YOLO(model_path)
+        self.model = YOLO(model_path, task="detect")
         self.conf = conf
         self.iou = iou
-        self.device = device
+        self.device = self._resolve_device(device)
         # Serialize GPU inference when multiple cameras run in parallel
         self._infer_lock = threading.Lock()
-        logger.info("Loaded YOLO model: %s", model_path)
+        logger.info("Loaded YOLO model: %s (device=%s)", model_path, self.device)
+
+    @staticmethod
+    def _resolve_device(device: Optional[object]) -> Optional[object]:
+        """Clamp CUDA index to an available GPU; fall back to cpu if none."""
+        try:
+            import torch
+        except ImportError:
+            return "cpu" if device is None else device
+
+        if not torch.cuda.is_available() or torch.cuda.device_count() == 0:
+            if device not in (None, "cpu"):
+                logger.warning("CUDA unavailable — using cpu (requested device=%s)", device)
+            return "cpu"
+
+        count = torch.cuda.device_count()
+        if device is None:
+            return 0
+        if isinstance(device, str) and device.lower() == "cpu":
+            return "cpu"
+        try:
+            idx = int(device)
+        except (TypeError, ValueError):
+            return device
+        if idx < 0 or idx >= count:
+            logger.warning(
+                "Invalid CUDA device=%s (available 0..%d) — using device=0",
+                device,
+                count - 1,
+            )
+            return 0
+        return idx
 
     def detect_persons(self, frame: np.ndarray) -> List[Tuple[float, float, float, float]]:
         with self._infer_lock:
@@ -698,6 +1142,34 @@ class SegmentConsumer:
     def _process_segment(self, item: QueuedSegment) -> None:
         path = item.path
         try:
+            # 1) Parse in-band KLV/ID3 metadata from the raw .ts (same as dashboard).
+            try:
+                ts_bytes = path.read_bytes()
+            except OSError as exc:
+                logger.error(
+                    "[%s] Cannot read seq=%d (%s): %s",
+                    item.camera_id,
+                    item.info.media_sequence,
+                    path,
+                    exc,
+                )
+                return
+
+            meta_samples = TsMetaParser().parse_segment(ts_bytes, frag_start_sec=0.0)
+            if meta_samples:
+                logger.debug(
+                    "[%s] seq=%d metadata samples=%d",
+                    item.camera_id,
+                    item.info.media_sequence,
+                    len(meta_samples),
+                )
+            else:
+                logger.debug(
+                    "[%s] seq=%d no in-band metadata — detecting on raw frames",
+                    item.camera_id,
+                    item.info.media_sequence,
+                )
+
             cap = cv2.VideoCapture(str(path))
             if not cap.isOpened():
                 logger.error(
@@ -708,6 +1180,10 @@ class SegmentConsumer:
                 )
                 return
 
+            fps = cap.get(cv2.CAP_PROP_FPS) or float(SOURCE_FPS)
+            if fps <= 1e-3:
+                fps = float(SOURCE_FPS)
+
             frame_idx = 0
             while True:
                 ok, frame = cap.read()
@@ -716,22 +1192,37 @@ class SegmentConsumer:
                 if frame_idx % FRAME_STRIDE != 0:
                     frame_idx += 1
                     continue
+
+                # 2) Align metadata to this frame time, draw overlay first.
+                media_t = frame_idx / fps
+                sample = pick_meta_sample(meta_samples, media_t)
+                annotated = (
+                    draw_metadata_overlay(frame, sample.json)
+                    if sample and sample.json
+                    else frame.copy()
+                )
+
+                # 3) Person detect on raw pixels; draw hits on the metadata frame.
                 persons = self.detector.detect_persons(frame)
-                hit = any(bbox_intersects_roi(b, self.roi_poly) for b in persons)
-                if hit:
+                hit_boxes = [
+                    b for b in persons if bbox_intersects_roi(b, self.roi_poly)
+                ]
+                if hit_boxes:
+                    annotated = draw_person_boxes(annotated, hit_boxes)
                     ts = time.strftime("%Y%m%d_%H%M%S")
                     out_name = (
                         f"{item.camera_id}_seq{item.info.media_sequence:010d}"
                         f"_f{frame_idx:05d}_{ts}.jpg"
                     )
                     out_path = self.output_dir / out_name
-                    cv2.imwrite(str(out_path), frame)
+                    cv2.imwrite(str(out_path), annotated)
                     self.frames_saved += 1
                     logger.info(
-                        "[%s] Saved frame → %s (persons=%d)",
+                        "[%s] Saved frame → %s (persons=%d meta=%s)",
                         item.camera_id,
                         out_path,
-                        len(persons),
+                        len(hit_boxes),
+                        "yes" if sample and sample.json else "no",
                     )
                 frame_idx += 1
 
