@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import shutil
 import threading
 import time
@@ -65,7 +66,22 @@ STREAMS: List[dict] = [
     },
 ]
 
-YOLO_MODEL = "yolo26m.onnx"
+PERSON_MODEL = "yolo26m.onnx"
+BALE_MODEL = "Sadaqat_V3_best.onnx"
+# Fallback when a camera is listed in neither set below (or has no "model" override)
+YOLO_MODEL = PERSON_MODEL
+
+# Assign cameras by camera_id (must match STREAMS entries).
+# Same camera MAY appear in BOTH sets — it will be processed by each model
+# as a separate run (separate temp/output dirs).
+PERSON_MODEL_CAMERAS = {
+    "Faisal-Spinning",
+    "Akram-Textile",
+}
+# Use set() when empty — bare {} is a dict in Python.
+# Example dual-model: BALE_MODEL_CAMERAS = {"Faisal-Spinning"}
+BALE_MODEL_CAMERAS: set[str] = set()
+
 PERSON_CLASS_ID = 0
 CONFIDENCE_THRESHOLD = 0.35
 IOU_THRESHOLD = 0.45
@@ -141,11 +157,18 @@ class StreamConfig:
     camera_id: str
     url: str
     roi_coords: List[Tuple[int, int]] = field(default_factory=lambda: list(ROI_COORDS))
+    model_path: str = YOLO_MODEL
+    model_tag: str = "default"  # "person" | "bale" | "custom" | "default"
     output_dir: Optional[Path] = None
+
+    @property
+    def run_id(self) -> str:
+        """Unique id per camera+model so dual-model cams don't clash on disk."""
+        return f"{self.camera_id}__{self.model_tag}"
 
     def __post_init__(self) -> None:
         if self.output_dir is None:
-            self.output_dir = OUTPUT_ROOT / self.camera_id
+            self.output_dir = OUTPUT_ROOT / self.run_id
 
 
 # ---------------------------------------------------------------------------
@@ -756,14 +779,39 @@ class BulkSegmentDownloader:
     def _path_for(self, segment: SegmentInfo) -> Path:
         return self.dest_dir / f"seg_{segment.media_sequence:010d}.ts"
 
+    def _cleanup_stale_partials(self) -> None:
+        """Remove leftover *.partial files from interrupted downloads."""
+        try:
+            removed = 0
+            for p in self.dest_dir.glob("*.partial"):
+                try:
+                    p.unlink()
+                    removed += 1
+                except OSError:
+                    pass
+            if removed:
+                logger.info(
+                    "Cleaned %d stale .partial file(s) in %s",
+                    removed,
+                    self.dest_dir,
+                )
+        except OSError as exc:
+            logger.warning("Failed cleaning partials in %s: %s", self.dest_dir, exc)
+
     async def _download_one(self, segment: SegmentInfo) -> Optional[Path]:
         dest = self._path_for(segment)
         if dest.exists() and dest.stat().st_size > 0:
             return dest
 
+        self.dest_dir.mkdir(parents=True, exist_ok=True)
         last_err: Optional[BaseException] = None
         async with self.semaphore:
             for attempt in range(1, self.retries + 1):
+                # Unique name avoids races when two tasks share a seq path.
+                tmp = self.dest_dir / (
+                    f"seg_{segment.media_sequence:010d}."
+                    f"{os.getpid()}.{attempt}.{time.time_ns()}.partial"
+                )
                 try:
                     async with self.session.get(
                         segment.absolute_uri,
@@ -778,7 +826,6 @@ class BulkSegmentDownloader:
                             )
                             return None
                         resp.raise_for_status()
-                        tmp = dest.with_suffix(".partial")
                         size = 0
                         with open(tmp, "wb") as fh:
                             async for chunk in resp.content.iter_chunked(64 * 1024):
@@ -786,7 +833,13 @@ class BulkSegmentDownloader:
                                 size += len(chunk)
                         if size <= 0:
                             raise IOError("empty segment body")
-                        tmp.replace(dest)
+                        if not tmp.exists():
+                            raise FileNotFoundError(
+                                f"partial missing after write: {tmp}"
+                            )
+                        self.dest_dir.mkdir(parents=True, exist_ok=True)
+                        # Atomic finalize; if dest already exists, replace it.
+                        os.replace(str(tmp), str(dest))
                         return dest
                 except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
                     last_err = exc
@@ -801,6 +854,12 @@ class BulkSegmentDownloader:
                         delay,
                     )
                     await asyncio.sleep(delay)
+                finally:
+                    try:
+                        if tmp.exists():
+                            tmp.unlink()
+                    except OSError:
+                        pass
 
         logger.error(
             "Giving up seq=%d after %d attempts: %s",
@@ -822,6 +881,9 @@ class BulkSegmentDownloader:
         """
         if not segments:
             return {}
+
+        self.dest_dir.mkdir(parents=True, exist_ok=True)
+        self._cleanup_stale_partials()
 
         total = len(segments)
         done = 0
@@ -908,7 +970,7 @@ class SegmentProducer:
         self.parser = PlaylistParser(config.url)
         self._seen: set[str] = set()
         self._stop = asyncio.Event()
-        self.temp_dir = TEMP_ROOT / config.camera_id
+        self.temp_dir = TEMP_ROOT / config.run_id
         self.temp_dir.mkdir(parents=True, exist_ok=True)
 
     def stop(self) -> None:
@@ -970,23 +1032,23 @@ class SegmentProducer:
             for wave_i, wave in enumerate(_chunked(historical, wave_size), start=1):
                 if self._stop.is_set():
                     break
-                label = f"{self.config.camera_id}/catch-up-wave{wave_i}/{n_waves}"
+                label = f"{self.config.run_id}/catch-up-wave{wave_i}/{n_waves}"
                 await self._download_wave_then_enqueue(downloader, wave, label)
 
             # ---- Live: poll m3u8 only after held snapshot is exhausted ----
-            logger.info("[%s] Catch-up done — live poll mode", self.config.camera_id)
+            logger.info("[%s] Catch-up done — live poll mode", self.config.run_id)
             while not self._stop.is_set():
                 try:
                     playlist = await asyncio.to_thread(self.parser.load)
                     live_segs = self.parser.segments_from_playlist(playlist)
                     new_segs = [s for s in live_segs if s.key not in self._seen]
                     if new_segs:
-                        label = f"{self.config.camera_id}/live"
+                        label = f"{self.config.run_id}/live"
                         await self._download_wave_then_enqueue(
                             downloader, new_segs, label
                         )
                 except Exception:
-                    logger.exception("[%s] Live poll error", self.config.camera_id)
+                    logger.exception("[%s] Live poll error", self.config.run_id)
                 try:
                     await asyncio.wait_for(
                         self._stop.wait(), timeout=LIVE_POLL_INTERVAL
@@ -1038,6 +1100,10 @@ class SegmentProducer:
 # YOLO inference + ROI (Consumer)
 # ---------------------------------------------------------------------------
 
+# One GPU lock for all models so person + bale inference don't overlap on the same device
+_GPU_INFER_LOCK = threading.Lock()
+
+
 class YOLODetector:
     def __init__(
         self,
@@ -1046,12 +1112,11 @@ class YOLODetector:
         iou: float = IOU_THRESHOLD,
         device: Optional[str] = None,
     ) -> None:
+        self.model_path = model_path
         self.model = YOLO(model_path, task="detect")
         self.conf = conf
         self.iou = iou
         self.device = self._resolve_device(device)
-        # Serialize GPU inference when multiple cameras run in parallel
-        self._infer_lock = threading.Lock()
         logger.info("Loaded YOLO model: %s (device=%s)", model_path, self.device)
 
     @staticmethod
@@ -1086,7 +1151,7 @@ class YOLODetector:
         return idx
 
     def detect_persons(self, frame: np.ndarray) -> List[Tuple[float, float, float, float]]:
-        with self._infer_lock:
+        with _GPU_INFER_LOCK:
             results = self.model.predict(
                 source=frame,
                 conf=self.conf,
@@ -1118,7 +1183,7 @@ class SegmentConsumer:
         self.queue = queue
         self.detector = detector
         self.roi_poly = roi_to_numpy(config.roi_coords)
-        self.output_dir = config.output_dir or (OUTPUT_ROOT / config.camera_id)
+        self.output_dir = config.output_dir or (OUTPUT_ROOT / config.run_id)
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.frames_saved = 0
         self.segments_processed = 0
@@ -1251,6 +1316,59 @@ class SegmentConsumer:
 # Orchestration
 # ---------------------------------------------------------------------------
 
+def _models_for_stream(entry: dict) -> List[Tuple[str, str]]:
+    """
+    Return [(model_tag, model_path), ...] for a STREAMS entry.
+
+    - Optional per-stream override: "model": "some.onnx" → single custom run.
+    - Camera in PERSON_MODEL_CAMERAS and/or BALE_MODEL_CAMERAS → one run per set.
+      Same camera in BOTH sets yields TWO runs (both models).
+    - In neither set → fallback YOLO_MODEL.
+    """
+    if entry.get("model"):
+        return [("custom", entry["model"])]
+
+    camera_id = entry["camera_id"]
+    models: List[Tuple[str, str]] = []
+    if camera_id in PERSON_MODEL_CAMERAS:
+        models.append(("person", PERSON_MODEL))
+    if camera_id in BALE_MODEL_CAMERAS:
+        models.append(("bale", BALE_MODEL))
+    if models:
+        if len(models) > 1:
+            logger.info(
+                "[%s] in BOTH model sets — running %d model(s): %s",
+                camera_id,
+                len(models),
+                ", ".join(f"{tag}={path}" for tag, path in models),
+            )
+        return models
+
+    logger.warning(
+        "[%s] not in PERSON_MODEL_CAMERAS or BALE_MODEL_CAMERAS — using default %s",
+        camera_id,
+        YOLO_MODEL,
+    )
+    return [("default", YOLO_MODEL)]
+
+
+def _expand_stream_configs(streams: Iterable[dict]) -> List[StreamConfig]:
+    configs: List[StreamConfig] = []
+    for entry in streams:
+        roi = list(entry.get("roi_coords", ROI_COORDS))
+        for model_tag, model_path in _models_for_stream(entry):
+            configs.append(
+                StreamConfig(
+                    camera_id=entry["camera_id"],
+                    url=entry["url"],
+                    roi_coords=roi,
+                    model_path=model_path,
+                    model_tag=model_tag,
+                )
+            )
+    return configs
+
+
 async def process_stream(
     config: StreamConfig,
     detector: YOLODetector,
@@ -1261,14 +1379,16 @@ async def process_stream(
     consumer = SegmentConsumer(config, queue, detector)
 
     logger.info(
-        "Starting stream camera_id=%s url=%s offset=%ss",
+        "Starting stream camera_id=%s model=%s(%s) url=%s offset=%ss",
         config.camera_id,
+        config.model_tag,
+        config.model_path,
         config.url,
         offset_seconds,
     )
 
-    prod_task = asyncio.create_task(producer.run(), name=f"prod-{config.camera_id}")
-    cons_task = asyncio.create_task(consumer.run(), name=f"cons-{config.camera_id}")
+    prod_task = asyncio.create_task(producer.run(), name=f"prod-{config.run_id}")
+    cons_task = asyncio.create_task(consumer.run(), name=f"cons-{config.run_id}")
 
     try:
         await asyncio.gather(prod_task, cons_task)
@@ -1277,40 +1397,40 @@ async def process_stream(
         raise
     finally:
         producer.stop()
-        cam_tmp = TEMP_ROOT / config.camera_id
+        cam_tmp = TEMP_ROOT / config.run_id
         if cam_tmp.exists():
             shutil.rmtree(cam_tmp, ignore_errors=True)
 
 
 async def process_all_streams(
     streams: Iterable[dict],
-    model_path: str = YOLO_MODEL,
     offset_seconds: float = CATCHUP_OFFSET_SECONDS,
     device: Optional[str] = None,
 ) -> None:
     OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
     TEMP_ROOT.mkdir(parents=True, exist_ok=True)
-    detector = YOLODetector(model_path=model_path, device=device)
 
-    configs = [
-        StreamConfig(
-            camera_id=entry["camera_id"],
-            url=entry["url"],
-            roi_coords=list(entry.get("roi_coords", ROI_COORDS)),
-        )
-        for entry in streams
-    ]
+    configs = _expand_stream_configs(streams)
+    detectors: Dict[str, YOLODetector] = {}
+    for cfg in configs:
+        if cfg.model_path not in detectors:
+            detectors[cfg.model_path] = YOLODetector(
+                model_path=cfg.model_path, device=device
+            )
+
     logger.info(
-        "Running %d stream(s) in parallel: %s",
+        "Running %d stream run(s) in parallel: %s",
         len(configs),
-        ", ".join(c.camera_id for c in configs),
+        ", ".join(f"{c.run_id}({c.model_path})" for c in configs),
     )
 
     # Live mode never ends, so cameras must run concurrently — not one-after-another.
     tasks = [
         asyncio.create_task(
-            process_stream(cfg, detector, offset_seconds=offset_seconds),
-            name=f"stream-{cfg.camera_id}",
+            process_stream(
+                cfg, detectors[cfg.model_path], offset_seconds=offset_seconds
+            ),
+            name=f"stream-{cfg.run_id}",
         )
         for cfg in configs
     ]
@@ -1320,7 +1440,7 @@ async def process_all_streams(
         try:
             await task
         except Exception:
-            logger.exception("[%s] Stream crashed", cfg.camera_id)
+            logger.exception("[%s] Stream crashed", cfg.run_id)
 
     await asyncio.gather(
         *[_watch(cfg, task) for cfg, task in zip(configs, tasks)]
@@ -1335,7 +1455,6 @@ def main() -> None:
         asyncio.run(
             process_all_streams(
                 STREAMS,
-                model_path=YOLO_MODEL,
                 offset_seconds=CATCHUP_OFFSET_SECONDS,
                 device=YOLO_DEVICE,
             )
